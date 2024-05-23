@@ -1,0 +1,352 @@
+import scapy.all as scapy
+import xml.dom.minidom as xmlminidom
+import re
+import pytz
+import logging
+import os
+import random
+from scapy.layers import http
+from datetime import datetime
+from queue import Queue
+
+logging.basicConfig(filename="/opt/sniffer/logs/log.txt", level=logging.DEBUG)
+body = ""
+current_url = ""
+# Cola para almacenar los paquetes
+packet_queue = Queue()
+
+def sniff():
+    fecha_hora_actual = getExecutionTime()
+    logging.info(fecha_hora_actual + " - sniffing...")
+    # Puerto e Interfaz de red a la que se anclará el sniffer para capturar los paquetes
+    scapy.sniff(filter="tcp port 80", iface="gnrz01", store=True, prn=packageSizing, timeout=20)
+
+def packageSizing(packet):
+    # Encolamos los paquetes
+    # en la misma forma que los paquetes van llegando, asi se guardaran
+    global packet_queue
+    packet_queue.put(packet)
+
+def sniffed_packages():
+    global packet_queue
+    global body
+    global current_url
+    packets = []
+    # Sacamos los paquetes de la cola para almacenarlos en un array para su facil manipulación
+    while not packet_queue.empty():
+        packet = packet_queue.get()
+        packets.append(packet)
+
+    # Filtrar solo los paquetes TCP
+    tcp_packets = [p for p in packets if http.TCP in p]
+    print("Cantidad de paquetes tcp: " + str(len(tcp_packets)))
+    # Ordenar la lista de menor a mayor
+    sorted_packets = sorted(tcp_packets, key=lambda pkt: pkt[http.TCP].seq)
+    # Creacion del paquete anterior o previo
+    prev_packet = None
+    for packetOne in sorted_packets:
+        if packetOne.haslayer(http.HTTP):
+            full_payload = b""
+            current_package = packetOne.getlayer(http.TCP)
+            if prev_packet is not None and current_package.seq == prev_packet.seq and current_package.ack == prev_packet.ack:
+                continue
+            # Aqui puedes procesar el paquete y verificar si contiene una peticion SOAP
+            http_layer = packetOne.getlayer(http.HTTPRequest)
+            content_type = ""
+            try:
+                content_type = str(http_layer.fields.get("Content_Type")).replace("'","").replace("b", "")
+            except:
+                pass
+
+            if content_type and ("text/xml" in content_type or "application/soap+xml" in content_type):
+                if prev_packet is not None and not belongs_to_request(current_package, prev_packet):
+                    if body != "":
+                        if current_package.haslayer(http.Raw):
+                            full_payload += bytes(current_package[http.Raw].load)
+                            # Convertimos el full_payload en una cadena de String
+                            fpStr = str(full_payload.decode("utf-8")).rstrip()
+                            print('Paquete de la nueva petición')
+                            print("Full payload str: " + fpStr)
+                        print("Info esta es la Secuencia: ", current_package.seq)
+                        print("Info este es el ACK: ", current_package.ack)
+                        print("Info carga util del paquete: ", len(current_package.payload))
+                        printAndResetBody()
+
+                logging.info('-----------------------------------------------------------------------')
+                # La peticion parece ser una peticion SOAP
+                serviceUrl = ""
+                try:
+                    headers = http_layer.Unknown_Headers
+                    serviceUrl = str(headers).replace("b", "").replace("'", "")
+                except:
+                    serviceUrl = "No se logro capturar la url de este servicio"
+                summary = packetOne.summary()
+                current_url = serviceUrl
+                logging.info('Peticion SOAP encontrada:')
+                logging.info(summary)
+                logging.info(serviceUrl)
+                print('Peticion SOAP encontrada:')
+                print(summary)
+                print(serviceUrl)
+            else:
+                if current_package.haslayer(http.Raw):
+                    full_payload += bytes(current_package[http.Raw].load)
+                    # Convertimos el full_payload en una cadena de String
+                    fpStr = str(full_payload.decode("utf-8")).rstrip()
+                    if "<SOAP-ENV:Envelope" in fpStr:
+                        continue
+                    if fpStr != "" and not fpStr.isdigit():
+                        # Comparar el número de secuencia del paquete actual con el número de secuencia
+                        # del paquete anterior más la longitud de carga útil del paquete anterior
+                        print("Info esta es la Secuencia: ", current_package.seq)
+                        print("Info este es el ACK: ", current_package.ack)
+                        print("Info carga util del paquete: ", len(current_package.payload))
+                        if prev_packet is None or belongs_to_request(current_package, prev_packet):
+                            # El paquete actual pertenece a la misma petición
+                            print('Paquete de la misma petición')
+                            print("Full payload str: " + fpStr)
+                            fpStr = identificationOfSpecialCharacters(fpStr)
+                            body += fpStr
+                        else:
+                            # El paquete actual pertenece a una nueva petición
+                            print('Paquete de la nueva petición')
+                            print("Full payload str: " + fpStr)
+                            fpStr = identificationOfSpecialCharacters(fpStr)
+                            if body != "":
+                                printAndResetBody()
+                            if body == "":
+                                body += fpStr
+
+            prev_packet = current_package
+
+    if body != "":
+        printAndResetBody()
+
+def belongs_to_request(packet, last_packet):
+    # Determine if a packet belongs to the same request as the last_packet
+    if packet.seq == last_packet.seq + len(last_packet.payload) and packet.ack == last_packet.ack:
+        return True
+    elif packet.ack == last_packet.seq + len(last_packet.payload):
+        return True
+    elif packet.seq == last_packet.ack and packet.ack == last_packet.seq + len(last_packet.payload):
+        return True
+    elif packet.seq > last_packet.seq + len(last_packet.payload):
+        return False
+    else:
+        return False
+
+def save_xml_in_the_log(xml_list_format):
+    global current_url
+    if current_url != "":
+        # Creamos el nombre del archivo y la carpeta con su respectivo formato
+        fileName = file_name_format(current_url)
+        folderName = folder_name_format()
+        # Creamos el archivo en la ruta especifica /opt/sniffer/logs/nombre_archivo
+        ruta_archivo = create_file(fileName, folderName)
+        # Generar un número aleatorio entero entre un rango específico
+        numero_entero_aleatorio = random.randint(1, 60000)
+        logger1 = logging.getLogger(str(numero_entero_aleatorio))
+        logger1.setLevel(logging.DEBUG)
+        file_handler1 = logging.FileHandler(ruta_archivo)
+        file_handler1.setLevel(logging.DEBUG)
+        logger1.addHandler(file_handler1)
+        logger1.info("\n")
+        logger1.info("-----------------------------------------------------------------------")
+        logger1.info('Peticion SOAP encontrada:')
+        logger1.info(current_url)
+        logger1.info("-----------------------------------------------------------------------")
+        fecha_hora_actual = getExecutionTime()
+        logger1.info('Inicio ---- ' + str(fecha_hora_actual))
+        logger1.info('-----------------------------------------------------------------------')
+        try:
+            if len(xml_list_format) == 2 or len(xml_list_format) > 2: 
+                bodyXml = xmlminidom.parseString(str(xml_list_format[0]))
+                bodyPretty =  bodyXml.toprettyxml()
+                responseXml = xmlminidom.parseString(str(xml_list_format[1]))
+                responsePretty = responseXml.toprettyxml()
+                logger1.info('Body de la Peticion SOAP encontrada:')
+                logger1.info(bodyPretty)
+                logger1.info('Response de la Peticion SOAP encontrada:')
+                logger1.info(responsePretty)
+            elif len(xml_list_format) == 1:
+                bodyXml = xmlminidom.parseString(str(xml_list_format[0]))
+                bodyPretty =  bodyXml.toprettyxml()
+                logger1.info('Body de la Peticion SOAP encontrada:')
+                logger1.info(bodyPretty)
+        except:
+            logger1.error('-----------------------------------------------------------------------------------------------')
+            logger1.error('Tratando de formatear e identar el xml aparecieron caracteres especiales o etiquetas sin cerrar')
+            logger1.error('-----------------------------------------------------------------------------------------------')
+            if len(xml_list_format) == 2 or len(xml_list_format) > 2: 
+                logger1.info('Body de la Peticion SOAP encontrada (Sin Identar):')
+                logger1.info(xml_list_format[0])
+                logger1.info('Response de la Peticion SOAP encontrada (Sin Identar):')
+                logger1.info(xml_list_format[1])
+            elif len(xml_list_format) == 1:
+                logger1.info('Body de la Peticion SOAP encontrada (Sin Identar):')
+                logger1.info(xml_list_format[0])
+        fecha_hora_actual = getExecutionTime()
+        logger1.info('Fin ---- ' + str(fecha_hora_actual))
+        logger1.info('-----------------------------------------------------------------------')
+    
+    current_url = ""
+
+def file_name_format(urlService: str):
+    fileName = "SOAP_"
+    # Sacamos el nombre del servicio de la url
+    urlService = urlService.replace("\"}", "")
+    service = urlService.split("//")[2]
+    # Adjuntamos el servicio al nombre del archivo
+    fileName += service + "_"
+    # Obtener la fecha y hora actual en la zona horaria UTC
+    now_utc = datetime.now(pytz.utc)
+    # Convertir la fecha y hora UTC a la zona horaria de Colombia
+    tz = pytz.timezone('America/Bogota')
+    now_colombia = now_utc.astimezone(tz)
+    time = str(now_colombia.strftime('%d_%H_%M_%S_%f')[:-3]) + str(now_colombia.strftime('_%Y'))
+    fileName += time
+    fileName += ".txt"
+    return fileName
+
+def folder_name_format():
+    folderName = ""
+    # Obtener la fecha y hora actual en la zona horaria UTC
+    now_utc = datetime.now(pytz.utc)
+    # Convertir la fecha y hora UTC a la zona horaria de Colombia
+    tz = pytz.timezone('America/Bogota')
+    now_colombia = now_utc.astimezone(tz)
+    time = str(now_colombia.strftime('%Y_%m_%d'))
+    folderName += time
+    return folderName
+
+def create_file(fileName: str, folder: str):
+    ruta = "/opt/sniffer/logs/" + folder
+    # Crear directorio si no existe
+    if not os.path.exists(ruta):
+        os.makedirs(ruta)
+    ruta_archivo = ruta + "/" + fileName
+    # Abrir archivo en modo de escritura
+    archivo = open(ruta_archivo, "w")
+    # Escribir en el archivo
+    archivo.write("-- Log de la aplicacion Capturador de Peticiones")
+    # Cerrar archivo
+    archivo.close()
+    # Establecer todos los permisos en el archivo
+    os.chmod(ruta_archivo, 0o777)
+    return ruta_archivo
+
+def printAndResetBody():
+    global body
+    if body != "" and "<env:Envelope" in body and "</env:Envelope>" in body:
+        body = refineXmlString(body)
+        xml_list = re.split(r"<env:Envelope", body)
+        fecha_hora_actual = getExecutionTime()
+        logging.info('-----------------------------------------------------------------------')
+        logging.info('Inicio ---- ' + str(fecha_hora_actual))
+        # Lista con solo los xml relevantes
+        xml_list_format = []
+        contador = 0
+        for xml in xml_list:
+            if "xmlns:env=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"" in xml:
+                xml = "<env:Envelope" + xml
+                # Para este String Eliminamos todo lo que este despues de la etiqueta </env:Envelope>
+                deleteAfterThis = "</env:Envelope>"
+                # encontramos la posicion de esa etiqueta:
+                position = xml.find(deleteAfterThis)
+                # Obtener la subcadena después de la palabra
+                substring = xml[position + len(deleteAfterThis):]
+                # Reemplazar la subcadena por una cadena vacía
+                xml = xml.replace(substring, "")
+                xml_list[contador] = xml
+                xml_list_format.append(xml)
+            contador += 1
+        try:
+            if len(xml_list_format) == 2 or len(xml_list_format) > 2: 
+                bodyXml = xmlminidom.parseString(str(xml_list_format[0]))
+                bodyPretty =  bodyXml.toprettyxml()
+                responseXml = xmlminidom.parseString(str(xml_list_format[1]))
+                responsePretty = responseXml.toprettyxml()
+                print('INFO -- Body de la Peticion SOAP encontrada:')
+                print(bodyPretty)
+                print('INFO -- Response de la Peticion SOAP encontrada:')
+                print(responsePretty)
+                logging.info("Body de la Peticion SOAP encontrada:")
+                logging.info(bodyPretty)
+                logging.info("Response de la Peticion SOAP encontrada:")
+                logging.info(bodyPretty)
+            elif len(xml_list_format) == 1:
+                bodyXml = xmlminidom.parseString(str(xml_list_format[0]))
+                bodyPretty =  bodyXml.toprettyxml()
+                print('INFO -- Body de la Peticion SOAP encontrada:')
+                print(bodyPretty)
+                logging.info("Body de la Peticion SOAP encontrada:")
+                logging.info(bodyPretty)
+        except:
+            logging.error('-----------------------------------------------------------------------------------------------')
+            logging.error('Tratando de formatear e identar el xml aparecieron caracteres especiales o etiquetas sin cerrar')
+            logging.error('-----------------------------------------------------------------------------------------------')
+            print('-----------------------------------------------------------------------------------------------')
+            print('Error -- Tratando de formatear e identar el xml aparecieron caracteres especiales o etiquetas sin cerrar')
+            print('-----------------------------------------------------------------------------------------------')
+            if len(xml_list_format) == 2 or len(xml_list_format) > 2: 
+                print('INFO -- Body de la Peticion SOAP encontrada (Sin Identar):')
+                print(xml_list_format[0])
+                print('INFO -- Response de la Peticion SOAP encontrada (Sin Identar):')
+                print(xml_list_format[1])
+                logging.info('Body de la Peticion SOAP encontrada (Sin Identar):')
+                logging.info(xml_list_format[0])
+                logging.info('Response de la Peticion SOAP encontrada (Sin Identar):')
+                logging.info(xml_list_format[1])
+            elif len(xml_list_format) == 1:
+                print('INFO -- Body de la Peticion SOAP encontrada (Sin Identar):')
+                print(xml_list_format[0])
+                logging.info('Body de la Peticion SOAP encontrada (Sin Identar):')
+                logging.info(xml_list_format[0])
+        # Creación del archivo y registro del log en su archivo especifico:
+        save_xml_in_the_log(xml_list_format)
+
+    body = ""
+
+def identificationOfSpecialCharacters(fpStr: str):
+    # Para este String tomamos todo lo que este antes del salto de linea
+    takeBeforeThis = "\n"
+    # encontramos la posicion de ese caracter:
+    position = str(fpStr).find(takeBeforeThis)
+    nextCaracter = fpStr[position:position+2]
+    if nextCaracter != "" and position <= 10:
+        # Obtener la subcadena antes de la palabra
+        substring = ""
+        try:
+            substring = fpStr[0:position]
+            substring += "\n"  
+            fpStr = fpStr.replace(substring, "")
+            if substring != "":
+                print("INFO - Estos son los posibles caracteres especiales que generaban error: " + substring)
+        except:
+            pass
+    return fpStr
+
+def getExecutionTime():
+    # Obtener la fecha y hora actual en la zona horaria UTC
+    now_utc = datetime.now(pytz.utc)
+    # Convertir la fecha y hora UTC a la zona horaria de Colombia
+    tz = pytz.timezone('America/Bogota')
+    now_colombia = now_utc.astimezone(tz)
+    return str(now_colombia.strftime('%d/%m/%Y %H:%M:%S.%f')[:-3])
+
+def refineXmlString(fpStr: str):
+    fpStr = fpStr.replace("\r", "").replace("\n148\n", "").replace("\n224\n", "")
+    fpStr = fpStr.replace("xsi:n1a81\n", "xsi:n").replace("categoriaxsi", "categoria xsi")
+    fpStr = fpStr.replace("resultadoxsi", "resultado xsi")
+    fpStr = fpStr.replace("fechaRadicacionxsi", "fechaRadicacion xsi")
+    fpStr = fpStr.replace("nombrePropietarioxsi", "nombrePropietario xsi")
+    return fpStr
+
+def main():
+    sniff()
+    sniffed_packages()
+
+if __name__  == '__main__':
+    logging.info("Iniciando Servicio...")
+    while True:
+        main()
