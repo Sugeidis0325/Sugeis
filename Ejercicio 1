@@ -1,0 +1,15 @@
+# Este archivo sera el que me permitirá ejecutar mi servicio en un servidor linux
+# por lo general los archivos .service seguardan en la siguiente ruta: /etc/systemd/system/capturador_peticiones.service
+# y lo guardaremos en esa ruta con el siguiente nombre: capturador_peticiones.service
+# la ruta quedaria asi - /etc/systemd/system/capturador_peticiones.service
+# systemctl start capturador_peticiones.service - iniciar servicio
+# systemctl stop capturador_peticiones.service - detener servicio
+
+[Unit]
+Description=Servicio Capturador de peticiones
+
+[Service]
+ExecStart=/opt/sniffer/env/bin/python3 /opt/sniffer/CapturadorPeticionesSoap.py
+
+[Install]
+WantedBy=multi-user.target 
